@@ -363,87 +363,61 @@ async function handleSmartSearch(request: Request, env: Env, cacheOnlyMode = fal
 
   console.log(`[SMART_SEARCH] Query: "${query}", depth: ${depth}, maxIterations: ${actualMaxIterations}`);
 
+  // Tool system prompt (same pattern as completions.ts - text-based tool calls)
+  const toolPrompt = `You are a research assistant. You have access to tools to help answer questions.
+
+Built-in tools:
+1. **web_search** - Search the web. Params: { "query": "search terms" }
+2. **web_extract** - Extract content from a URL. Params: { "url": "https://..." }
+
+To call a tool, include EXACTLY this format in your response (you MUST include both the opening AND closing tags):
+<tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>
+
+IMPORTANT: Always close with </tool_call>. Never omit the closing tag.
+
+After receiving tool results, synthesize them into a helpful, complete answer. Do NOT include tool_call blocks in your final answer to the user.
+When you have enough information, provide your final answer directly without any tool_call blocks.`;
+
   // Initialize conversation (same pattern as completions.ts)
-  const messages: any[] = [
-    {
-      role: "system",
-      content: `You are a research assistant with access to these tools:
-- web_search: Search the web for information
-- web_extract: Extract content from a specific URL
-
-Your goal is to answer the user's question by iteratively using these tools.
-When you have gathered enough information, return your final answer.
-
-Tool calling format:
-{
-  "action": "web_search" | "web_extract" | "answer",
-  "tool_args": { "query": "...", "url": "..." },
-  "reasoning": "Why you're taking this action",
-  "answer": "Your final answer (only if action is 'answer')"
-}`
-    },
+  const a0Messages: A0Message[] = [
+    { role: "system", content: toolPrompt },
     { role: "user", content: query }
   ];
 
-  const schema = {
-    type: "object",
-    properties: {
-      action: {
-        type: "string",
-        enum: ["web_search", "web_extract", "answer"]
-      },
-      tool_args: {
-        type: "object",
-        properties: {
-          query: { type: "string" },
-          url: { type: "string" }
-        }
-      },
-      reasoning: { type: "string" },
-      answer: { type: "string" }
-    },
-    required: ["action", "reasoning"]
-  };
-
   const sources: any[] = [];
   const steps: any[] = [];
+  let finalContent = "";
 
-  // Iterative loop (same as task_agent in completions.ts)
+  // Iterative tool-calling loop (same as completions.ts agent loop)
   for (let i = 0; i < actualMaxIterations; i++) {
-    console.log(`[SMART_SEARCH] Iteration ${i + 1}/${actualMaxIterations}`);
+    console.log(`[SMART_SEARCH] Step ${i + 1}/${actualMaxIterations}`);
 
-    // Call a0 LLM
+    // Call a0 LLM (plain text, no schema)
     const llmStart = Date.now();
-    const llmResponse = await callA0LLM(messages, schema);
+    const completion = await callA0LLM(a0Messages);
     const llmTime = Date.now() - llmStart;
 
-    const structured = llmResponse.schema_data;
+    console.log(`[SMART_SEARCH] LLM response (${llmTime}ms): ${completion.length}ch`);
 
-    if (!structured || !structured.action) {
-      console.error(`[SMART_SEARCH] Invalid LLM response:`, llmResponse);
-      return jsonResponse({
-        error: 'Invalid LLM response',
-        iteration: i + 1
-      }, 500);
-    }
+    // Parse tool calls from <tool_call> blocks
+    const toolCalls = parseToolCalls(completion);
+    console.log(`[SMART_SEARCH] Parsed ${toolCalls.length} tool calls: [${toolCalls.map(t => t.name).join(", ")}]`);
 
-    console.log(`[SMART_SEARCH] LLM action: ${structured.action} (${llmTime}ms)`);
+    // No tool calls = final answer
+    if (toolCalls.length === 0) {
+      finalContent = completion;
+      console.log(`[SMART_SEARCH] Final answer reached in ${i + 1} steps`);
 
-    steps.push({
-      iteration: i + 1,
-      action: structured.action,
-      reasoning: structured.reasoning,
-      llmTime: `${llmTime}ms`
-    });
-
-    // Check if final answer
-    if (structured.action === "answer") {
-      console.log(`[SMART_SEARCH] Final answer reached in ${i + 1} iterations`);
+      steps.push({
+        iteration: i + 1,
+        action: 'answer',
+        llmTime: `${llmTime}ms`
+      });
 
       return jsonResponse({
         success: true,
         query,
-        answer: structured.answer || llmResponse.completion,
+        answer: finalContent,
         sources,
         steps,
         iterations: i + 1,
@@ -451,49 +425,76 @@ Tool calling format:
       });
     }
 
-    // Execute tool
-    let toolResult: string;
-    const toolStart = Date.now();
+    // Execute tool calls
+    const results: { name: string; result: string }[] = [];
 
-    if (structured.action === "web_search") {
-      const searchQuery = structured.tool_args?.query || query;
-      console.log(`[SMART_SEARCH] Executing web_search: "${searchQuery}"`);
-      toolResult = await executeWebSearch(searchQuery);
-      sources.push({ type: 'search', query: searchQuery });
+    for (const tc of toolCalls) {
+      const toolStart = Date.now();
+      let result: string;
 
-    } else if (structured.action === "web_extract") {
-      const extractUrl = structured.tool_args?.url;
-      if (!extractUrl) {
-        toolResult = "Error: No URL provided for extraction";
+      if (tc.name === "web_search") {
+        const searchQuery = tc.arguments.query || query;
+        console.log(`[SMART_SEARCH] Executing web_search: "${searchQuery}"`);
+        result = await executeWebSearch(searchQuery);
+        sources.push({ type: 'search', query: searchQuery });
+      } else if (tc.name === "web_extract") {
+        const extractUrl = tc.arguments.url;
+        if (!extractUrl) {
+          result = "Error: No URL provided for extraction";
+        } else {
+          console.log(`[SMART_SEARCH] Executing web_extract: "${extractUrl}"`);
+          result = await executeWebExtract(extractUrl);
+          sources.push({ type: 'extract', url: extractUrl });
+        }
       } else {
-        console.log(`[SMART_SEARCH] Executing web_extract: "${extractUrl}"`);
-        toolResult = await executeWebExtract(extractUrl);
-        sources.push({ type: 'extract', url: extractUrl });
+        result = `Unknown tool: ${tc.name}`;
       }
 
-    } else {
-      toolResult = `Unknown action: ${structured.action}`;
+      const toolTime = Date.now() - toolStart;
+      console.log(`[SMART_SEARCH] Tool ${tc.name} done (${toolTime}ms): ${result.length}ch`);
+      results.push({ name: tc.name, result });
     }
 
-    const toolTime = Date.now() - toolStart;
-    console.log(`[SMART_SEARCH] Tool executed in ${toolTime}ms, result length: ${toolResult.length}`);
-
-    steps[steps.length - 1].toolTime = `${toolTime}ms`;
-    steps[steps.length - 1].resultLength = toolResult.length;
-
-    // Add tool result to conversation (same pattern as completions.ts)
-    messages.push({
-      role: "assistant",
-      content: `I'm using ${structured.action}... ${structured.reasoning}`
+    steps.push({
+      iteration: i + 1,
+      action: toolCalls.map(t => t.name).join(', '),
+      llmTime: `${llmTime}ms`
     });
-    messages.push({
-      role: "system",
-      content: `TOOL_RESULT: ${toolResult.slice(0, 4000)}`  // Limit to avoid token overflow
-    });
+
+    // Add assistant message and tool results to conversation (same as completions.ts)
+    const cleanedAssistant = stripToolCalls(completion);
+    if (cleanedAssistant) {
+      a0Messages.push({ role: "assistant", content: cleanedAssistant });
+    } else {
+      a0Messages.push({ role: "assistant", content: `[Calling tools: ${toolCalls.map(t => t.name).join(", ")}]` });
+    }
+
+    const resultsText = results
+      .map(r => `[Tool Result - ${r.name}]:\n${r.result.slice(0, 6000)}`)
+      .join("\n\n");
+    a0Messages.push({ role: "user", content: resultsText });
+
+    // If last step, force final response
+    if (i >= actualMaxIterations - 1) {
+      console.log(`[SMART_SEARCH] Max steps reached — forcing final response`);
+      a0Messages.push({
+        role: "user",
+        content: "[System: You have reached the maximum number of tool steps. Please provide your final response now based on all the information gathered. Do NOT use any more tool_call blocks.]"
+      });
+      const finalCompletion = await callA0LLM(a0Messages);
+      finalContent = stripToolCalls(finalCompletion);
+
+      return jsonResponse({
+        success: true,
+        query,
+        answer: finalContent,
+        sources,
+        steps,
+        iterations: i + 1,
+        totalTime: `${Date.now() - start}ms`
+      });
+    }
   }
-
-  // Max iterations reached
-  console.log(`[SMART_SEARCH] Max iterations (${actualMaxIterations}) reached`);
 
   return jsonResponse({
     success: false,
@@ -556,35 +557,107 @@ async function executeWebExtract(url: string): Promise<string> {
   }
 }
 
-// ─── a0 LLM Integration ─────────────────────────────────────────────────────
+// ─── a0 LLM Integration (same pattern as completions.ts) ────────────────────
 
-async function callA0LLM(messages: any[], schema?: any): Promise<any> {
-  try {
+interface A0Message {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+async function callA0LLM(messages: A0Message[]): Promise<string> {
+  const MAX_RETRIES = 2;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const start = Date.now();
+
     const res = await fetch(A0_LLM_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages, schema }),
+      body: JSON.stringify({
+        messages,
+        temperature: 0.7,
+        max_tokens: 4096,
+      }),
     });
 
     if (!res.ok) {
-      throw new Error(`a0 LLM request failed: ${res.status} ${res.statusText}`);
+      const errText = await res.text();
+      console.error(`[callA0LLM] Error ${res.status} (${Date.now() - start}ms): ${errText.slice(0, 500)}`);
+      throw new Error(`A0 API error: ${res.status} ${errText}`);
     }
 
-    return await res.json();
+    const data = await res.json();
+    const completion = data.completion || '';
+    console.log(`[callA0LLM] Response (${Date.now() - start}ms, attempt ${attempt + 1}): ${completion.length}ch`);
 
-  } catch (err: any) {
-    console.error('[callA0LLM] Error:', err);
-    throw err;
+    if (completion.length > 0) {
+      return completion;
+    }
+
+    // Empty completion — retry with nudge (same as completions.ts)
+    if (attempt < MAX_RETRIES) {
+      console.warn(`[callA0LLM] Empty completion (attempt ${attempt + 1}/${MAX_RETRIES + 1}), retrying...`);
+      const lastMsg = messages[messages.length - 1];
+      if (lastMsg.role === "user" && !lastMsg.content.includes("[Please respond")) {
+        messages = [
+          ...messages.slice(0, -1),
+          {
+            role: "user" as const,
+            content: lastMsg.content + "\n\n[Please respond with your full answer. Do not leave your response empty.]",
+          },
+        ];
+      }
+    }
   }
+
+  console.error(`[callA0LLM] Empty completion after ${MAX_RETRIES + 1} attempts`);
+  return "";
 }
+
+// ─── Tool Call Parser (same as completions.ts) ──────────────────────────────
+
+interface ParsedToolCall {
+  name: string;
+  arguments: Record<string, any>;
+}
+
+function parseToolCalls(text: string): ParsedToolCall[] {
+  const calls: ParsedToolCall[] = [];
+  const regex = /<tool_call>([\s\S]*?)(?:<\/tool_call>|$)/g;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1].trim());
+      if (parsed.name && parsed.arguments) {
+        calls.push(parsed);
+      }
+    } catch {
+      // Try lenient parsing - extract name and arguments
+      const nameMatch = match[1].match(/"name"\s*:\s*"([^"]+)"/);
+      const argsMatch = match[1].match(/"arguments"\s*:\s*(\{[^}]+\})/);
+      if (nameMatch && argsMatch) {
+        try {
+          calls.push({ name: nameMatch[1], arguments: JSON.parse(argsMatch[1]) });
+        } catch { /* skip malformed */ }
+      }
+    }
+  }
+  return calls;
+}
+
+function stripToolCalls(text: string): string {
+  return text.replace(/<tool_call>[\s\S]*?(?:<\/tool_call>|$)/g, "").trim();
+}
+
+// ─── Reranker ───────────────────────────────────────────────────────────────
 
 async function rerankResults(query: string, results: SearchResult[]): Promise<SearchResult[]> {
   if (results.length <= 1) return results;
 
-  const messages = [
+  const messages: A0Message[] = [
     {
       role: "system",
-      content: "You are a search relevance expert. Analyze search results and assign relevance scores."
+      content: "You are a search relevance expert. You ALWAYS respond with valid JSON. Never respond with an empty message."
     },
     {
       role: "user",
@@ -594,44 +667,32 @@ Results to rank:
 ${results.map((r, i) => `${i + 1}. Title: ${r.title}\n   Snippet: ${r.snippet}\n   URL: ${r.url}`).join('\n\n')}
 
 Assign each result a relevance score from 0.0 to 1.0 (where 1.0 is most relevant).
-Return JSON with scores for each result.`
+Return ONLY a JSON array of scores in order, like: [0.9, 0.7, 0.5, 0.3, 0.1]
+Do NOT include any other text, just the JSON array.`
     }
   ];
 
-  const schema = {
-    type: "object",
-    properties: {
-      scores: {
-        type: "array",
-        description: "Array of relevance scores, one per result in order",
-        items: {
-          type: "object",
-          properties: {
-            position: { type: "number", description: "Original position (1-indexed)" },
-            score: { type: "number", description: "Relevance score 0.0-1.0" },
-            reasoning: { type: "string", description: "Brief reasoning for the score" }
-          },
-          required: ["position", "score"]
-        }
-      }
-    },
-    required: ["scores"]
-  };
-
   try {
-    const response = await callA0LLM(messages, schema);
-    const scores = response.schema_data?.scores || [];
+    const response = await callA0LLM(messages);
+
+    // Extract JSON array from response
+    const arrayMatch = response.match(/\[[\d.,\s]+\]/);
+    if (!arrayMatch) {
+      console.warn(`[rerankResults] Could not parse scores from: ${response.slice(0, 200)}`);
+      return results;
+    }
+
+    const scores: number[] = JSON.parse(arrayMatch[0]);
 
     if (scores.length !== results.length) {
       console.warn(`[rerankResults] Score count mismatch: ${scores.length} vs ${results.length}`);
-      return results;  // Fallback
+      return results;
     }
 
     // Apply scores and sort
     const rankedResults = results.map((result, idx) => ({
       ...result,
-      score: scores[idx]?.score || 0.5,
-      rerankReasoning: scores[idx]?.reasoning
+      score: scores[idx] || 0.5,
     }));
 
     rankedResults.sort((a, b) => (b.score || 0) - (a.score || 0));
@@ -653,51 +714,74 @@ Return JSON with scores for each result.`
 
 function parseSearchResults(text: string, maxResults: number): SearchResult[] {
   const results: SearchResult[] = [];
-  const lines = text.split('\n');
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
 
-  let currentResult: Partial<SearchResult> | null = null;
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-
-    if (trimmed.startsWith('##')) {
-      // New result - save previous
-      if (currentResult && currentResult.title && currentResult.url) {
-        results.push({
-          title: currentResult.title,
-          url: currentResult.url,
-          snippet: (currentResult.snippet || '').trim().slice(0, 300),
-          position: results.length + 1
-        });
-      }
-
-      // Start new result
-      currentResult = {
-        title: trimmed.replace(/^##\s*/, '').trim(),
-        snippet: '',
-        url: ''
-      };
-
-    } else if (trimmed.match(/^https?:\/\//)) {
-      // URL line
-      if (currentResult) {
-        currentResult.url = trimmed;
-      }
-
-    } else if (trimmed && currentResult) {
-      // Snippet line
-      currentResult.snippet = (currentResult.snippet || '') + trimmed + ' ';
+  // Skip DuckDuckGo header lines (region selectors, time filters, etc.)
+  // Find the first line that looks like a search result title
+  let startIdx = 0;
+  for (let i = 0; i < lines.length; i++) {
+    // Look for lines followed by a URL - that's where results start
+    if (i + 1 < lines.length && lines[i + 1].match(/^https?:\/\/|^\w+\.\w+\.\w+|^\w+\.\w+\//)) {
+      startIdx = i;
+      break;
     }
   }
 
-  // Add last result
-  if (currentResult && currentResult.title && currentResult.url) {
-    results.push({
-      title: currentResult.title,
-      url: currentResult.url,
-      snippet: (currentResult.snippet || '').trim().slice(0, 300),
-      position: results.length + 1
-    });
+  // Parse results: pattern is Title, URL (with optional date), Snippet
+  let i = startIdx;
+  while (i < lines.length && results.length < maxResults) {
+    const line = lines[i];
+
+    // Skip empty/short lines and known non-result lines
+    if (line.length < 5 || line.startsWith('All Regions') || line.startsWith('Any Time') || line.startsWith('Past ')) {
+      i++;
+      continue;
+    }
+
+    // Check if this line is a title (next line should contain a URL)
+    const nextLine = i + 1 < lines.length ? lines[i + 1] : '';
+    const urlMatch = nextLine.match(/(https?:\/\/[^\s]+|(?:www\.)?[\w-]+\.[\w.-]+(?:\/[^\s]*)?)/);
+
+    if (urlMatch) {
+      const title = line.replace(/\s*\|.*$/, '').trim(); // Clean title
+      let url = urlMatch[1];
+
+      // Ensure URL has protocol
+      if (!url.startsWith('http')) {
+        url = 'https://' + url;
+      }
+
+      // Collect snippet from remaining text on URL line and subsequent lines
+      const snippetParts: string[] = [];
+      const afterUrl = nextLine.replace(urlMatch[0], '').replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z?/g, '').trim();
+      if (afterUrl.length > 10) {
+        snippetParts.push(afterUrl);
+      }
+
+      // Check if the line after URL line is snippet text (not another title)
+      if (i + 2 < lines.length) {
+        const snippetLine = lines[i + 2];
+        const lineAfterSnippet = i + 3 < lines.length ? lines[i + 3] : '';
+        const isSnippet = snippetLine.length > 15 && !lineAfterSnippet.match(/(https?:\/\/|^\w+\.\w+\.\w+|^\w+\.\w+\/)/);
+
+        if (isSnippet && snippetParts.length === 0) {
+          snippetParts.push(snippetLine);
+        }
+      }
+
+      if (title.length > 3) {
+        results.push({
+          title,
+          url,
+          snippet: snippetParts.join(' ').trim().slice(0, 300),
+          position: results.length + 1,
+        });
+      }
+
+      i += 2; // Skip title + URL line
+    } else {
+      i++;
+    }
   }
 
   return results.slice(0, maxResults);
