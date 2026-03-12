@@ -12,11 +12,19 @@
  * - <250ms p50 latency (cached), <500ms (uncached)
  */
 
+import {
+  validateApiKey as supabaseValidateApiKey,
+  checkRateLimit as supabaseCheckRateLimit,
+  logUsage
+} from './supabase-integration';
+
 interface Env {
   CACHE: KVNamespace;
   API_KEYS: KVNamespace;
   ENVIRONMENT: string;
   VERSION: string;
+  SUPABASE_URL: string;
+  SUPABASE_SERVICE_KEY: string;
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -83,25 +91,29 @@ export default {
       });
     }
 
-    // Auth check (for now, accept any Bearer token)
+    // Auth check
     const apiKey = request.headers.get('Authorization')?.replace('Bearer ', '');
     if (!apiKey) {
       return jsonResponse({ error: 'Missing Authorization header' }, 401);
     }
 
-    // Validate API key
-    const isValid = await validateApiKey(apiKey, env);
-    if (!isValid) {
+    // Validate API key with Supabase
+    const user = await supabaseValidateApiKey(apiKey, {
+      SUPABASE_URL: env.SUPABASE_URL,
+      SUPABASE_SERVICE_KEY: env.SUPABASE_SERVICE_KEY
+    });
+
+    if (!user) {
       return jsonResponse({ error: 'Invalid API key' }, 401);
     }
 
     // Rate limiting
-    const rateLimit = await checkRateLimit(apiKey, env);
+    const rateLimit = supabaseCheckRateLimit(user);
     if (!rateLimit.allowed) {
       return jsonResponse({
         error: 'Rate limit exceeded',
         limit: rateLimit.limit,
-        remaining: 0,
+        remaining: rateLimit.remaining,
         resetAt: rateLimit.resetAt
       }, 429);
     }
@@ -145,6 +157,27 @@ export default {
       const processingTime = Date.now() - start;
       response.headers.set('X-Processing-Time', `${processingTime}ms`);
 
+      // Log usage to Supabase (async, don't block response)
+      const clientIP = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || undefined;
+      const wasCached = response.headers.get('X-Cached') === 'true';
+
+      ctx.waitUntil(
+        logUsage(
+          apiKey,
+          url.pathname,
+          response.status,
+          processingTime,
+          wasCached,
+          {
+            SUPABASE_URL: env.SUPABASE_URL,
+            SUPABASE_SERVICE_KEY: env.SUPABASE_SERVICE_KEY
+          },
+          clientIP
+        ).catch(err => {
+          console.error('[USAGE_LOG] Error:', err);
+        })
+      );
+
       return response;
 
     } catch (err: any) {
@@ -176,11 +209,13 @@ async function handleSearch(request: Request, env: Env): Promise<Response> {
   const cached = await env.CACHE.get(cacheKey, 'json');
   if (cached) {
     console.log(`[SEARCH] Cache HIT for "${query}"`);
-    return jsonResponse({
+    const response = jsonResponse({
       ...cached,
       cached: true,
       processingTime: `${Date.now() - start}ms`
     });
+    response.headers.set('X-Cached', 'true');
+    return response;
   }
 
   console.log(`[SEARCH] Cache MISS for "${query}" - fetching...`);
@@ -236,11 +271,13 @@ async function handleExtract(request: Request, env: Env): Promise<Response> {
   const cached = await env.CACHE.get(cacheKey, 'json');
   if (cached) {
     console.log(`[EXTRACT] Cache HIT for "${url}"`);
-    return jsonResponse({
+    const response = jsonResponse({
       ...cached,
       cached: true,
       processingTime: `${Date.now() - start}ms`
     });
+    response.headers.set('X-Cached', 'true');
+    return response;
   }
 
   console.log(`[EXTRACT] Cache MISS for "${url}" - fetching...`);
@@ -621,26 +658,6 @@ function parseSearchResults(text: string, maxResults: number): SearchResult[] {
   return results.slice(0, maxResults);
 }
 
-async function validateApiKey(key: string, env: Env): Promise<boolean> {
-  // For MVP, accept any non-empty key
-  // TODO: Implement proper API key validation with env.API_KEYS
-  // const keyData = await env.API_KEYS.get(key, 'json');
-  // return keyData !== null && !keyData.revoked;
-
-  return key.length > 0;
-}
-
-async function checkRateLimit(key: string, env: Env): Promise<{ allowed: boolean; limit: number; resetAt?: number }> {
-  // TODO: Implement rate limiting
-  // const rateLimitKey = `ratelimit:${key}:${getHourBucket()}`;
-  // const currentCount = await env.CACHE.get(rateLimitKey);
-  // ...
-
-  return {
-    allowed: true,
-    limit: 1000  // 1000 req/hour default
-  };
-}
 
 function jsonResponse(data: any, status = 200): Response {
   return new Response(JSON.stringify(data, null, 2), {
