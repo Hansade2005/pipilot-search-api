@@ -12,19 +12,11 @@
  * - <250ms p50 latency (cached), <500ms (uncached)
  */
 
-import {
-  validateApiKey as supabaseValidateApiKey,
-  checkRateLimit as supabaseCheckRateLimit,
-  logUsage
-} from './supabase-integration';
-
 interface Env {
   CACHE: KVNamespace;
   API_KEYS: KVNamespace;
   ENVIRONMENT: string;
   VERSION: string;
-  SUPABASE_URL: string;
-  SUPABASE_SERVICE_KEY: string;
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -97,18 +89,14 @@ export default {
       return jsonResponse({ error: 'Missing Authorization header' }, 401);
     }
 
-    // Validate API key with Supabase
-    const user = await supabaseValidateApiKey(apiKey, {
-      SUPABASE_URL: env.SUPABASE_URL,
-      SUPABASE_SERVICE_KEY: env.SUPABASE_SERVICE_KEY
-    });
-
-    if (!user) {
-      return jsonResponse({ error: 'Invalid API key' }, 401);
+    // Validate API key with Cloudflare KV
+    const keyData = await env.API_KEYS.get(apiKey, 'json');
+    if (!keyData || keyData.revoked) {
+      return jsonResponse({ error: 'Invalid or revoked API key' }, 401);
     }
 
-    // Rate limiting
-    const rateLimit = supabaseCheckRateLimit(user);
+    // Rate limiting check
+    const rateLimit = await checkRateLimit(apiKey, env);
     if (!rateLimit.allowed) {
       return jsonResponse({
         error: 'Rate limit exceeded',
@@ -157,26 +145,8 @@ export default {
       const processingTime = Date.now() - start;
       response.headers.set('X-Processing-Time', `${processingTime}ms`);
 
-      // Log usage to Supabase (async, don't block response)
-      const clientIP = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || undefined;
-      const wasCached = response.headers.get('X-Cached') === 'true';
-
-      ctx.waitUntil(
-        logUsage(
-          apiKey,
-          url.pathname,
-          response.status,
-          processingTime,
-          wasCached,
-          {
-            SUPABASE_URL: env.SUPABASE_URL,
-            SUPABASE_SERVICE_KEY: env.SUPABASE_SERVICE_KEY
-          },
-          clientIP
-        ).catch(err => {
-          console.error('[USAGE_LOG] Error:', err);
-        })
-      );
+      // Increment usage counter in KV (async, don't block response)
+      ctx.waitUntil(incrementUsageCounter(apiKey, env));
 
       return response;
 
@@ -667,6 +637,50 @@ function jsonResponse(data: any, status = 200): Response {
       ...CORS_HEADERS
     }
   });
+}
+
+// ─── KV-based API Key Management ────────────────────────────────────────────
+
+async function checkRateLimit(apiKey: string, env: Env): Promise<{ allowed: boolean; limit: number; remaining: number; resetAt?: number }> {
+  const hourBucket = getHourBucket();
+  const rateLimitKey = `ratelimit:${apiKey}:${hourBucket}`;
+
+  const currentCount = parseInt(await env.CACHE.get(rateLimitKey) || '0');
+  const limit = 1000; // 1000 requests per hour default
+
+  if (currentCount >= limit) {
+    const now = new Date();
+    const nextHour = new Date(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours() + 1, 0, 0, 0);
+
+    return {
+      allowed: false,
+      limit,
+      remaining: 0,
+      resetAt: nextHour.getTime()
+    };
+  }
+
+  // Increment counter
+  await env.CACHE.put(rateLimitKey, (currentCount + 1).toString(), { expirationTtl: 3600 });
+
+  return {
+    allowed: true,
+    limit,
+    remaining: limit - currentCount - 1
+  };
+}
+
+async function incrementUsageCounter(apiKey: string, env: Env): Promise<void> {
+  try {
+    const keyData = await env.API_KEYS.get(apiKey, 'json');
+    if (keyData) {
+      keyData.totalRequests = (keyData.totalRequests || 0) + 1;
+      keyData.lastUsedAt = new Date().toISOString();
+      await env.API_KEYS.put(apiKey, JSON.stringify(keyData));
+    }
+  } catch (err) {
+    console.error('[incrementUsageCounter] Error:', err);
+  }
 }
 
 // ─── Utility ────────────────────────────────────────────────────────────────
