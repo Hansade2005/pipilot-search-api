@@ -1,0 +1,19 @@
+{
+  "name": "pipilot-search-api",
+  "version": "1.0.0",
+  "description": "PiPilot Search API - The most powerful, cheapest AI search API",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "keywords": ["search", "api", "ai", "pipilot"],
+  "author": "Hans Ade - Pixelways Solutions Inc",
+  "license": "MIT",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241127.0",
+    "wrangler": "^3.94.0",
+    "typescript": "^5.3.3"
+  }
+}
