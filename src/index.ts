@@ -33,6 +33,11 @@ const CORS_HEADERS = {
 
 const MAX_SMART_SEARCH_ITERATIONS = 5;
 
+// Global rate limiting (Cloudflare free tier limits)
+const DAILY_REQUEST_LIMIT = 95000; // 95k of 100k to leave buffer
+const QUOTA_WARNING_THRESHOLD = 0.8; // 80% = start serving cache-only
+const QUOTA_CRITICAL_THRESHOLD = 0.95; // 95% = queue requests
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 interface SearchRequest {
@@ -76,11 +81,35 @@ export default {
 
     // Health check (no auth required)
     if (url.pathname === '/health') {
+      const quota = await getGlobalQuotaStatus(env);
       return jsonResponse({
         status: 'ok',
         version: env.VERSION || '1.0.0',
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        quota: {
+          used: quota.used,
+          limit: quota.limit,
+          remaining: quota.remaining,
+          percentage: quota.percentage,
+          resetsAt: quota.resetsAt
+        }
       });
+    }
+
+    // Global quota check (BEFORE auth to prevent quota exhaustion)
+    const quota = await checkGlobalQuota(env);
+
+    if (quota.status === 'exhausted') {
+      return jsonResponse({
+        error: 'Service quota exhausted',
+        message: 'Daily API quota reached. Service will resume tomorrow.',
+        quota: {
+          used: quota.used,
+          limit: quota.limit,
+          resetsAt: quota.resetsAt
+        },
+        retryAfter: Math.ceil((quota.resetsAt - Date.now()) / 1000)
+      }, 503);
     }
 
     // Auth check
@@ -110,17 +139,20 @@ export default {
     try {
       let response: Response;
 
+      // Pass quota status to handlers for cache-only mode
+      const cacheOnlyMode = quota.status === 'warning' || quota.status === 'critical';
+
       switch (url.pathname) {
         case '/search':
-          response = await handleSearch(request, env);
+          response = await handleSearch(request, env, cacheOnlyMode);
           break;
 
         case '/extract':
-          response = await handleExtract(request, env);
+          response = await handleExtract(request, env, cacheOnlyMode);
           break;
 
         case '/smart-search':
-          response = await handleSmartSearch(request, env);
+          response = await handleSmartSearch(request, env, cacheOnlyMode);
           break;
 
         case '/':
@@ -145,8 +177,21 @@ export default {
       const processingTime = Date.now() - start;
       response.headers.set('X-Processing-Time', `${processingTime}ms`);
 
-      // Increment usage counter in KV (async, don't block response)
-      ctx.waitUntil(incrementUsageCounter(apiKey, env));
+      // Add quota headers
+      response.headers.set('X-Quota-Used', quota.used.toString());
+      response.headers.set('X-Quota-Remaining', quota.remaining.toString());
+      response.headers.set('X-Quota-Limit', quota.limit.toString());
+
+      if (cacheOnlyMode) {
+        response.headers.set('X-Cache-Only-Mode', 'true');
+        response.headers.set('X-Quota-Warning', 'Approaching daily limit - serving cached results only');
+      }
+
+      // Increment counters in KV (async, don't block response)
+      ctx.waitUntil(Promise.all([
+        incrementUsageCounter(apiKey, env),
+        incrementGlobalQuota(env, response.headers.get('X-Cached') === 'true')
+      ]));
 
       return response;
 
@@ -163,7 +208,7 @@ export default {
 
 // ─── Handler: Search ────────────────────────────────────────────────────────
 
-async function handleSearch(request: Request, env: Env): Promise<Response> {
+async function handleSearch(request: Request, env: Env, cacheOnlyMode = false): Promise<Response> {
   const start = Date.now();
   const body = await request.json() as SearchRequest;
   const { query, maxResults = 10, rerank = true } = body;
@@ -172,7 +217,7 @@ async function handleSearch(request: Request, env: Env): Promise<Response> {
     return jsonResponse({ error: 'Missing or empty query parameter' }, 400);
   }
 
-  console.log(`[SEARCH] Query: "${query}", maxResults: ${maxResults}, rerank: ${rerank}`);
+  console.log(`[SEARCH] Query: "${query}", maxResults: ${maxResults}, rerank: ${rerank}, cacheOnly: ${cacheOnlyMode}`);
 
   // Check cache
   const cacheKey = `search:${query}:${maxResults}:${rerank}`;
@@ -186,6 +231,16 @@ async function handleSearch(request: Request, env: Env): Promise<Response> {
     });
     response.headers.set('X-Cached', 'true');
     return response;
+  }
+
+  // If cache-only mode and no cache, return error
+  if (cacheOnlyMode) {
+    return jsonResponse({
+      error: 'Cache miss in quota-limited mode',
+      message: 'Daily quota approaching limit. Only cached results are available. Try again later or use a different query.',
+      query,
+      suggestion: 'Try a more common search query that may be cached'
+    }, 503);
   }
 
   console.log(`[SEARCH] Cache MISS for "${query}" - fetching...`);
@@ -225,7 +280,7 @@ async function handleSearch(request: Request, env: Env): Promise<Response> {
 
 // ─── Handler: Extract ───────────────────────────────────────────────────────
 
-async function handleExtract(request: Request, env: Env): Promise<Response> {
+async function handleExtract(request: Request, env: Env, cacheOnlyMode = false): Promise<Response> {
   const start = Date.now();
   const body = await request.json() as ExtractRequest;
   const { url, format = 'markdown' } = body;
@@ -234,7 +289,7 @@ async function handleExtract(request: Request, env: Env): Promise<Response> {
     return jsonResponse({ error: 'Missing or empty url parameter' }, 400);
   }
 
-  console.log(`[EXTRACT] URL: "${url}", format: ${format}`);
+  console.log(`[EXTRACT] URL: "${url}", format: ${format}, cacheOnly: ${cacheOnlyMode}`);
 
   // Check cache
   const cacheKey = `extract:${url}:${format}`;
@@ -248,6 +303,16 @@ async function handleExtract(request: Request, env: Env): Promise<Response> {
     });
     response.headers.set('X-Cached', 'true');
     return response;
+  }
+
+  // If cache-only mode and no cache, return error
+  if (cacheOnlyMode) {
+    return jsonResponse({
+      error: 'Cache miss in quota-limited mode',
+      message: 'Daily quota approaching limit. Only cached content is available.',
+      url,
+      suggestion: 'Try again tomorrow when quota resets'
+    }, 503);
   }
 
   console.log(`[EXTRACT] Cache MISS for "${url}" - fetching...`);
@@ -275,13 +340,23 @@ async function handleExtract(request: Request, env: Env): Promise<Response> {
 
 // ─── Handler: Smart Search (Iterative Q&A) ─────────────────────────────────
 
-async function handleSmartSearch(request: Request, env: Env): Promise<Response> {
+async function handleSmartSearch(request: Request, env: Env, cacheOnlyMode = false): Promise<Response> {
   const start = Date.now();
   const body = await request.json() as SmartSearchRequest;
   const { query, depth = 'normal', maxIterations = 3 } = body;
 
   if (!query || query.trim() === '') {
     return jsonResponse({ error: 'Missing or empty query parameter' }, 400);
+  }
+
+  // Smart search cannot work in cache-only mode
+  if (cacheOnlyMode) {
+    return jsonResponse({
+      error: 'Smart search unavailable in quota-limited mode',
+      message: 'Daily quota approaching limit. Smart search requires multiple API calls and is disabled.',
+      query,
+      suggestion: 'Use /search endpoint for cached results or try again tomorrow'
+    }, 503);
   }
 
   const actualMaxIterations = Math.min(maxIterations, MAX_SMART_SEARCH_ITERATIONS);
@@ -688,4 +763,105 @@ async function incrementUsageCounter(apiKey: string, env: Env): Promise<void> {
 function getHourBucket(): string {
   const now = new Date();
   return `${now.getUTCFullYear()}-${now.getUTCMonth() + 1}-${now.getUTCDate()}-${now.getUTCHours()}`;
+}
+
+function getDayBucket(): string {
+  const now = new Date();
+  return `${now.getUTCFullYear()}-${now.getUTCMonth() + 1}-${now.getUTCDate()}`;
+}
+
+function getNextMidnightUTC(): number {
+  const now = new Date();
+  const tomorrow = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0));
+  return tomorrow.getTime();
+}
+
+// ─── Global Quota Management ────────────────────────────────────────────────
+
+async function getGlobalQuotaStatus(env: Env) {
+  const dayBucket = getDayBucket();
+  const quotaKey = `global:quota:${dayBucket}`;
+
+  const currentUsage = parseInt(await env.CACHE.get(quotaKey) || '0');
+  const remaining = Math.max(0, DAILY_REQUEST_LIMIT - currentUsage);
+  const percentage = Math.round((currentUsage / DAILY_REQUEST_LIMIT) * 100);
+
+  return {
+    used: currentUsage,
+    limit: DAILY_REQUEST_LIMIT,
+    remaining,
+    percentage,
+    resetsAt: getNextMidnightUTC()
+  };
+}
+
+async function checkGlobalQuota(env: Env) {
+  const status = await getGlobalQuotaStatus(env);
+
+  // Exhausted (>= 95k of 95k)
+  if (status.used >= DAILY_REQUEST_LIMIT * QUOTA_CRITICAL_THRESHOLD) {
+    return {
+      ...status,
+      status: 'exhausted' as const
+    };
+  }
+
+  // Critical (>= 90.25k of 95k = 95%)
+  if (status.used >= DAILY_REQUEST_LIMIT * QUOTA_CRITICAL_THRESHOLD) {
+    return {
+      ...status,
+      status: 'critical' as const
+    };
+  }
+
+  // Warning (>= 76k of 95k = 80%)
+  if (status.used >= DAILY_REQUEST_LIMIT * QUOTA_WARNING_THRESHOLD) {
+    return {
+      ...status,
+      status: 'warning' as const
+    };
+  }
+
+  // Normal
+  return {
+    ...status,
+    status: 'ok' as const
+  };
+}
+
+async function incrementGlobalQuota(env: Env, wasCached: boolean): Promise<void> {
+  try {
+    // Only count uncached requests toward quota
+    if (wasCached) {
+      console.log('[QUOTA] Cached request - not counted toward quota');
+      return;
+    }
+
+    const dayBucket = getDayBucket();
+    const quotaKey = `global:quota:${dayBucket}`;
+
+    const currentUsage = parseInt(await env.CACHE.get(quotaKey) || '0');
+    const newUsage = currentUsage + 1;
+
+    // Cache until end of day (UTC midnight)
+    const now = Date.now();
+    const midnight = getNextMidnightUTC();
+    const ttl = Math.floor((midnight - now) / 1000);
+
+    await env.CACHE.put(quotaKey, newUsage.toString(), { expirationTtl: ttl });
+
+    const percentage = Math.round((newUsage / DAILY_REQUEST_LIMIT) * 100);
+    console.log(`[QUOTA] Global usage: ${newUsage}/${DAILY_REQUEST_LIMIT} (${percentage}%)`);
+
+    // Log warnings at thresholds
+    if (newUsage === Math.floor(DAILY_REQUEST_LIMIT * QUOTA_WARNING_THRESHOLD)) {
+      console.warn(`[QUOTA] ⚠️ WARNING: Reached 80% of daily quota (${newUsage}/${DAILY_REQUEST_LIMIT})`);
+    }
+    if (newUsage === Math.floor(DAILY_REQUEST_LIMIT * QUOTA_CRITICAL_THRESHOLD)) {
+      console.error(`[QUOTA] 🚨 CRITICAL: Reached 95% of daily quota (${newUsage}/${DAILY_REQUEST_LIMIT})`);
+    }
+
+  } catch (err) {
+    console.error('[incrementGlobalQuota] Error:', err);
+  }
 }
