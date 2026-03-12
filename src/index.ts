@@ -31,7 +31,7 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
-const MAX_SMART_SEARCH_ITERATIONS = 5;
+const MAX_SMART_SEARCH_ITERATIONS = 8;
 
 // Global rate limiting (Cloudflare free tier limits)
 const DAILY_REQUEST_LIMIT = 95000; // 95k of 100k to leave buffer
@@ -359,24 +359,59 @@ async function handleSmartSearch(request: Request, env: Env, cacheOnlyMode = fal
     }, 503);
   }
 
-  const actualMaxIterations = Math.min(maxIterations, MAX_SMART_SEARCH_ITERATIONS);
+  const actualMaxIterations = Math.min(maxIterations || depthInfo.defaultIter, MAX_SMART_SEARCH_ITERATIONS);
 
   console.log(`[SMART_SEARCH] Query: "${query}", depth: ${depth}, maxIterations: ${actualMaxIterations}`);
 
-  // Tool system prompt (same pattern as completions.ts - text-based tool calls)
-  const toolPrompt = `You are a research assistant. You have access to tools to help answer questions.
+  // Depth config: controls how aggressively the agent researches
+  const depthConfig = {
+    quick: { strategy: 'Answer quickly with minimal tool use. One search is usually enough.', defaultIter: 2 },
+    normal: { strategy: 'Research thoroughly. Follow promising leads and extract key pages.', defaultIter: 4 },
+    deep: { strategy: 'Research exhaustively. Leave no stone unturned. Follow every lead, extract multiple sources, cross-reference facts, and trace claims to their origin.', defaultIter: 6 },
+  };
+  const depthInfo = depthConfig[depth] || depthConfig.normal;
 
-Built-in tools:
+  // Tool system prompt - enhanced for autonomous deep research
+  const toolPrompt = `You are an elite research agent. Your job is to find accurate, comprehensive answers by autonomously searching the web and reading pages. You are relentless, resourceful, and thorough.
+
+## Tools
 1. **web_search** - Search the web. Params: { "query": "search terms" }
-2. **web_extract** - Extract content from a URL. Params: { "url": "https://..." }
+2. **web_extract** - Extract full content from a URL. Params: { "url": "https://..." }
 
-To call a tool, include EXACTLY this format in your response (you MUST include both the opening AND closing tags):
+To call a tool, use EXACTLY this format (MUST include both opening AND closing tags):
 <tool_call>{"name": "tool_name", "arguments": {"param": "value"}}</tool_call>
 
-IMPORTANT: Always close with </tool_call>. Never omit the closing tag.
+## Research Strategy: ${depthInfo.strategy}
 
-After receiving tool results, synthesize them into a helpful, complete answer. Do NOT include tool_call blocks in your final answer to the user.
-When you have enough information, provide your final answer directly without any tool_call blocks.`;
+## Core Behavior - CRITICAL
+1. **Be proactive**: Don't just search once and give up. If initial results are vague, search again with different keywords. Rephrase, use synonyms, try related terms, add site-specific filters.
+2. **Dive into pages**: When search results mention a relevant page (an about page, a blog post, a profile, documentation), USE web_extract to read it. URLs in search results are gold — extract them.
+3. **Trace to the source**: If a search result references a person, company, or fact, follow the trail. Extract the actual page to get details. Don't just rely on search snippets — they're often incomplete or outdated.
+4. **Use domain knowledge**: If a query mentions a website (e.g., "example.com"), proactively check common pages like /about, /team, /blog, /docs. These often have the answers.
+5. **Cross-reference**: If you find a claim, try to verify it from a second source. Multiple confirming sources = higher confidence answer.
+6. **Refine searches**: If your first search returns irrelevant results, don't repeat the same query. Try:
+   - Adding quotes around key phrases: "exact phrase"
+   - Adding the domain: site:example.com
+   - Using different terminology
+   - Searching for related entities
+7. **Multiple tool calls per step**: You can call multiple tools in one response. If you found several promising URLs, extract them all at once.
+
+## CRITICAL RULES
+- ALWAYS use at least one tool before answering. NEVER answer from memory alone. You MUST search or extract first.
+- Your FIRST response must ALWAYS contain a tool_call. No exceptions.
+- Do NOT narrate what you plan to do — just DO it. Call the tools immediately.
+- If a query mentions a specific website, your FIRST action should be web_extract on that site (or its /about, /team page).
+
+## When to stop
+- You have a clear, well-sourced answer with specific facts (names, dates, numbers)
+- You've checked at least one primary source (not just search snippets)
+- Provide your final answer directly WITHOUT any tool_call blocks
+
+## Answer format
+- Lead with the direct answer
+- Include specific details (names, dates, numbers, quotes)
+- Cite your sources naturally (mention where you found the info)
+- If information conflicts between sources, note the discrepancy`;
 
   // Initialize conversation (same pattern as completions.ts)
   const a0Messages: A0Message[] = [
@@ -403,8 +438,60 @@ When you have enough information, provide your final answer directly without any
     const toolCalls = parseToolCalls(completion);
     console.log(`[SMART_SEARCH] Parsed ${toolCalls.length} tool calls: [${toolCalls.map(t => t.name).join(", ")}]`);
 
-    // No tool calls = final answer
+    // No tool calls found
     if (toolCalls.length === 0) {
+      // If this is the first step and the LLM didn't use tools, force a search/extract
+      // (a0 sometimes ignores tool instructions on first turn)
+      if (i === 0) {
+        console.log(`[SMART_SEARCH] LLM skipped tools on step 1 — forcing initial research`);
+
+        // Check if query mentions a specific URL/domain to extract
+        const urlMatch = query.match(/(?:https?:\/\/)?([a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,}(?:\/[^\s,)\]]*)?)/);
+        const forcedCalls: ParsedToolCall[] = [];
+
+        if (urlMatch) {
+          const domain = urlMatch[1].replace(/[)\].,]+$/, '');
+          const extractUrl = domain.startsWith('http') ? domain : `https://${domain}`;
+          // Extract the mentioned site + its /about page
+          forcedCalls.push({ name: 'web_extract', arguments: { url: extractUrl } });
+          if (!extractUrl.includes('/about')) {
+            forcedCalls.push({ name: 'web_extract', arguments: { url: `${extractUrl}/about` } });
+          }
+        }
+        // Always do a web search too
+        forcedCalls.push({ name: 'web_search', arguments: { query } });
+
+        const forcedResults: { name: string; result: string }[] = [];
+        for (const tc of forcedCalls) {
+          const toolStart = Date.now();
+          let result: string;
+          if (tc.name === 'web_search') {
+            result = await executeWebSearch(tc.arguments.query);
+            sources.push({ type: 'search', query: tc.arguments.query });
+          } else {
+            result = await executeWebExtract(tc.arguments.url);
+            sources.push({ type: 'extract', url: tc.arguments.url });
+          }
+          console.log(`[SMART_SEARCH] Forced ${tc.name} done (${Date.now() - toolStart}ms): ${result.length}ch`);
+          forcedResults.push({ name: tc.name, result });
+        }
+
+        steps.push({
+          iteration: i + 1,
+          action: forcedCalls.map(t => t.name).join(', ') + ' (forced)',
+          llmTime: `${llmTime}ms`
+        });
+
+        // Feed results back
+        a0Messages.push({ role: "assistant", content: completion || "[Researching...]" });
+        const resultsText = forcedResults
+          .map(r => `[Tool Result - ${r.name}]:\n${r.result.slice(0, 6000)}`)
+          .join("\n\n");
+        a0Messages.push({ role: "user", content: resultsText });
+        continue;
+      }
+
+      // Otherwise it's a real final answer
       finalContent = completion;
       console.log(`[SMART_SEARCH] Final answer reached in ${i + 1} steps`);
 
