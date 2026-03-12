@@ -31,7 +31,7 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
-const MAX_SMART_SEARCH_ITERATIONS = 8;
+const MAX_SMART_SEARCH_ITERATIONS = 30;
 
 // Global rate limiting (Cloudflare free tier limits)
 const DAILY_REQUEST_LIMIT = 95000; // 95k of 100k to leave buffer
@@ -365,9 +365,9 @@ async function handleSmartSearch(request: Request, env: Env, cacheOnlyMode = fal
 
   // Depth config: controls how aggressively the agent researches
   const depthConfig = {
-    quick: { strategy: 'Answer quickly with minimal tool use. One search is usually enough.', defaultIter: 2 },
-    normal: { strategy: 'Research thoroughly. Follow promising leads and extract key pages.', defaultIter: 4 },
-    deep: { strategy: 'Research exhaustively. Leave no stone unturned. Follow every lead, extract multiple sources, cross-reference facts, and trace claims to their origin.', defaultIter: 6 },
+    quick: { strategy: 'Answer quickly with minimal tool use. One search is usually enough.', defaultIter: 3 },
+    normal: { strategy: 'Research thoroughly. Follow promising leads and extract key pages.', defaultIter: 8 },
+    deep: { strategy: 'Research exhaustively. Leave no stone unturned. Follow every lead, extract multiple sources, cross-reference facts, and trace claims to their origin.', defaultIter: 15 },
   };
   const depthInfo = depthConfig[depth] || depthConfig.normal;
 
